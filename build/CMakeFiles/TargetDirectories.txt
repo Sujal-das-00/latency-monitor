@@ -1,0 +1,3 @@
+/home/suajldas/Desktop/latency tracker/build/CMakeFiles/latency_detector.dir
+/home/suajldas/Desktop/latency tracker/build/CMakeFiles/edit_cache.dir
+/home/suajldas/Desktop/latency tracker/build/CMakeFiles/rebuild_cache.dir

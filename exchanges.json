@@ -1,0 +1,119 @@
+{
+  "reference": {
+    "name": "Binance",
+    "type": "binance",
+    "base_url": "wss://stream.binance.com:9443",
+    "symbols": [
+      { "local": "solusdt", "display": "SOL/USDT" },
+      { "local": "btcusdt", "display": "BTC/USDT" },
+      { "local": "ethusdt", "display": "ETH/USDT" }
+    ]
+  },
+  "targets": [
+    {
+      "name": "OKX",
+      "type": "okx",
+      "url": "wss://ws.okx.com:8443/ws/v5/public",
+      "symbols": [
+        { "local": "SOL-USDT", "display": "SOL/USDT" },
+        { "local": "BTC-USDT", "display": "BTC/USDT" },
+        { "local": "ETH-USDT", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "Bybit",
+      "type": "bybit",
+      "url": "wss://stream.bybit.com/v5/public/spot",
+      "symbols": [
+        { "local": "SOLUSDT", "display": "SOL/USDT" },
+        { "local": "BTCUSDT", "display": "BTC/USDT" },
+        { "local": "ETHUSDT", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "Kraken",
+      "type": "kraken",
+      "url": "wss://ws.kraken.com",
+      "symbols": [
+        { "local": "SOL/USD", "display": "SOL/USD" },
+        { "local": "XBT/USD", "display": "BTC/USD" },
+        { "local": "ETH/USD", "display": "ETH/USD" }
+      ]
+    },
+    {
+      "name": "Coinbase",
+      "type": "coinbase",
+      "url": "wss://advanced-trade-ws.coinbase.com",
+      "symbols": [
+        { "local": "SOL-USD", "display": "SOL/USD" },
+        { "local": "BTC-USD", "display": "BTC/USD" },
+        { "local": "ETH-USD", "display": "ETH/USD" }
+      ]
+    },
+    {
+      "name": "Gate.io",
+      "type": "gateio",
+      "url": "wss://api.gateio.ws/ws/v4/",
+      "symbols": [
+        { "local": "SOL_USDT", "display": "SOL/USDT" },
+        { "local": "BTC_USDT", "display": "BTC/USDT" },
+        { "local": "ETH_USDT", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "MEXC",
+      "type": "mexc",
+      "url": "wss://wbs-api.mexc.com/ws",
+      "symbols": [
+        { "local": "SOLUSDT", "display": "SOL/USDT" },
+        { "local": "BTCUSDT", "display": "BTC/USDT" },
+        { "local": "ETHUSDT", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "Bitget",
+      "type": "bitget",
+      "url": "wss://ws.bitget.com/v2/ws/public",
+      "symbols": [
+        { "local": "SOLUSDT", "display": "SOL/USDT" },
+        { "local": "BTCUSDT", "display": "BTC/USDT" },
+        { "local": "ETHUSDT", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "Phemex",
+      "type": "phemex",
+      "url": "wss://ws.phemex.com",
+      "symbols": [
+        { "local": "sSOLUSDT", "display": "SOL/USDT" },
+        { "local": "sBTCUSDT", "display": "BTC/USDT" },
+        { "local": "sETHUSDT", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "XT.com",
+      "type": "xt",
+      "url": "wss://stream.xt.com/public",
+      "symbols": [
+        { "local": "sol_usdt", "display": "SOL/USDT" },
+        { "local": "btc_usdt", "display": "BTC/USDT" },
+        { "local": "eth_usdt", "display": "ETH/USDT" }
+      ]
+    },
+    {
+      "name": "BingX",
+      "type": "bingx",
+      "url": "wss://open-api-ws.bingx.com/market",
+      "symbols": [
+        { "local": "SOL-USDT", "display": "SOL/USDT" },
+        { "local": "BTC-USDT", "display": "BTC/USDT" },
+        { "local": "ETH-USDT", "display": "ETH/USDT" }
+      ]
+    }
+  ],
+  "signal_open_bps": 4.0,
+  "signal_close_bps": 1.5,
+  "signal_min_ms": 40,
+  "stats_interval_sec": 1,
+  "rolling_window": 1000
+}

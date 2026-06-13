@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(g++ --version)",
+      "Bash(cmake --version)",
+      "Read(//usr/include/boost/**)",
+      "Bash(openssl version *)",
+      "Read(//usr/include/nlohmann/**)",
+      "Read(//usr/**)",
+      "Bash(cd \"/home/suajldas/Desktop/latency tracker\" && echo \"=== errors.log ===\" && cat logs/errors.log 2>/dev/null | sort | uniq -c | head; echo \"=== stderr ===\" && cat /tmp/run.err)",
+      "Read(//tmp/**)",
+      "Bash(rm -rf logs)",
+      "Bash(timeout 15 ./build/latency_detector)",
+      "Bash(echo \"exit:$? \\(124=timeout, expected\\)\")",
+      "Bash(sed 's/\\\\x1b\\\\[[0-9;]*m//g; s/\\\\x1b\\\\[[HJ0-9;]*[HJ]//g' /tmp/run.out)",
+      "Bash(sed 's/\"signal_open_bps\": 5.0/\"signal_open_bps\": 0.2/; s/\"signal_close_bps\": 2.0/\"signal_close_bps\": 0.1/' exchanges.json)",
+      "Bash(timeout 18 ./build/latency_detector /tmp/lowthresh.json)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(cd \"/home/suajldas/Desktop/latency tracker\" && echo \"=== Active signals seen during run? ===\" && sed 's/\\\\x1b\\\\[[0-9;]*m//g' /tmp/run2.out | grep -A1 \"Active signals\" | grep -v \"Active signals\" | grep -v \"^--\" | sort -u | head; echo \"=== render sample ===\"; sed 's/\\\\x1b\\\\[[0-9;]*m//g; s/\\\\x1b\\\\[[HJ0-9;]*[HJ]//g' /tmp/run2.out | grep -E \"Bybit |signals|→\" | tail -8)",
+      "Bash(sed 's/\"signal_open_bps\": 5.0/\"signal_open_bps\": 0.5/; s/\"signal_close_bps\": 2.0/\"signal_close_bps\": 0.3/; s/\"signal_min_ms\": 50/\"signal_min_ms\": 1/' exchanges.json)",
+      "Bash(timeout 25 ./build/latency_detector /tmp/osc.json)",
+      "Bash(grep -oE \"[+-][0-9.]+$\")",
+      "Bash(sed 's/\"signal_open_bps\": 5.0/\"signal_open_bps\": 0.45/; s/\"signal_close_bps\": 2.0/\"signal_close_bps\": 0.7/; s/\"signal_min_ms\": 50/\"signal_min_ms\": 1/' exchanges.json)",
+      "Bash(timeout 20 ./build/latency_detector /tmp/osc2.json)",
+      "Bash(python3 capture.py '{\"label\":\"Coinbase\",\"host\":\"advanced-trade-ws.coinbase.com\",\"path\":\"/\",\"subs\":[{\"type\":\"subscribe\",\"product_ids\":[\"SOL-USD\",\"BTC-USD\"],\"channel\":\"level2\"}],\"n\":6,\"timeout\":4}')",
+      "Bash(python3 capture.py '{\"label\":\"GateIO\",\"host\":\"api.gateio.ws\",\"path\":\"/ws/v4/\",\"subs\":[{\"time\":1700000000,\"channel\":\"spot.order_book_update\",\"event\":\"subscribe\",\"payload\":[\"BTC_USDT\",\"SOL_USDT\"]}],\"n\":6,\"timeout\":4}')",
+      "Bash(cd \"/home/suajldas/Desktop/latency tracker\" && rm -f logs/*.csv logs/errors.log)"
+    ],
+    "additionalDirectories": [
+      "/tmp",
+      "/home/suajldas/Desktop/latency tracker/logs"
+    ]
+  }
+}
