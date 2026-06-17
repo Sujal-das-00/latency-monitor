@@ -1,7 +1,10 @@
 // latency_detector — multi-symbol latency arbitrage detector
 //
-// Measures price lag between a reference feed (Binance, combined-stream)
-// and N target exchanges, for SOL/USDT, BTC/USDT and ETH/USDT simultaneously.
+// Measures price lag between a reference feed (any configured exchange) and
+// N target exchanges, for SOL/USDT, BTC/USDT and ETH/USDT simultaneously.
+// The reference data source is config-driven: set "reference.type" to any
+// supported exchange ("binance", "okx", "bybit", ...) and it connects through
+// the same adapter machinery as the targets.
 // Everything runs async on a single io_context / single thread.
 // Adding/removing a target or symbol is a config-file change only
 // (exchanges.json).
@@ -82,6 +85,11 @@ struct FeedSnapshot {
     int64_t exch_ts  = 0;   // exchange-reported ms
     int64_t local_ts = 0;   // our clock ms at receive time
     bool    valid    = false;
+
+    // Summed notional (quote ccy, e.g. USDT) over the top 3 book levels.
+    // -1.0 when the adapter only receives top-of-book (cannot compute top-3).
+    double  bid_depth_usdt = -1.0;
+    double  ask_depth_usdt = -1.0;
 };
 
 // Per (exchange, symbol) rolling metrics, signal state and CSV.
@@ -108,6 +116,13 @@ struct SymbolState {
     double      avg_duration_ms  = 0.0;
     int64_t     gap_start_time   = 0;     // when |delta| first crossed open
     std::string signal_dir;               // "CHEAPER" / "RICHER"
+
+    // detection-time context, captured when the signal opens, emitted on close
+    double  entry_bps             = -1.0; // |gap| at first detection (instant fill)
+    int64_t signal_to_detect_ms   = -1;   // signal price age when gap detected
+    double  entry_bid_depth_usdt  = -1.0; // target top-3 bid notional at detection
+    double  entry_ask_depth_usdt  = -1.0; // target top-3 ask notional at detection
+    double  entry_price_chg_1m_bps = -1.0;// signal mid 60s move at detection
 
     // csv
     std::ofstream csv;
@@ -289,6 +304,43 @@ static std::string to_hex(const std::string& s) {
     return out;
 }
 
+// Coerce a json level field (price or qty) that may be a string or a number
+// into a double. Returns 0.0 for anything unparseable.
+static double jnum(const json& v) {
+    try {
+        if (v.is_string()) return std::stod(v.get<std::string>());
+        if (v.is_number()) return v.get<double>();
+    } catch (...) {
+    }
+    return 0.0;
+}
+
+// Sum notional (price*qty, i.e. quote currency) over the top N levels of an
+// order-book side given as a json array of [price, qty, ...] entries.
+// Returns -1.0 if no usable level was found (caller writes -1 to CSV).
+static double depth_notional(const json& levels, int n) {
+    if (!levels.is_array()) return -1.0;
+    double tot = 0.0;
+    int c = 0;
+    for (const auto& lvl : levels) {
+        if (c >= n) break;
+        if (!lvl.is_array() || lvl.size() < 2) continue;
+        tot += jnum(lvl[0]) * jnum(lvl[1]);
+        ++c;
+    }
+    return c > 0 ? tot : -1.0;
+}
+
+// UTC hour-of-day (0-23) and day-of-week (0=Monday) for a unix-ms timestamp.
+static void utc_hour_dow(int64_t ms, int& hour, int& dow) {
+    if (ms <= 0) { hour = -1; dow = -1; return; }
+    std::time_t t = static_cast<std::time_t>(ms / 1000);
+    std::tm tmv{};
+    gmtime_r(&t, &tmv);
+    hour = tmv.tm_hour;
+    dow  = (tmv.tm_wday + 6) % 7;  // tm_wday: 0=Sunday -> remap to 0=Monday
+}
+
 // ─────────────────────── subscribe messages per type ───────────────────
 //
 // Messages to send (in order) after the WS handshake. Empty = none needed
@@ -425,6 +477,8 @@ static ParseResult parse_message(FeedType t, const std::string& msg,
                 if (bids->empty() || asks->empty()) return r;
                 r.snap.bid = std::stod((*bids)[0][0].get<std::string>());
                 r.snap.ask = std::stod((*asks)[0][0].get<std::string>());
+                r.snap.bid_depth_usdt = depth_notional(*bids, 3);
+                r.snap.ask_depth_usdt = depth_notional(*asks, 3);
                 r.snap.exch_ts = d.contains("E") ? d["E"].get<int64_t>() : local_ts;
                 r.symbol_idx = it->second;
                 break;
@@ -446,6 +500,8 @@ static ParseResult parse_message(FeedType t, const std::string& msg,
                 if (d["bids"].empty() || d["asks"].empty()) return r;
                 r.snap.bid = std::stod(d["bids"][0][0].get<std::string>());
                 r.snap.ask = std::stod(d["asks"][0][0].get<std::string>());
+                r.snap.bid_depth_usdt = depth_notional(d["bids"], 3);
+                r.snap.ask_depth_usdt = depth_notional(d["asks"], 3);
                 r.snap.exch_ts = std::stoll(d["ts"].get<std::string>());
                 r.symbol_idx = it->second;
                 break;
@@ -523,6 +579,18 @@ static ParseResult parse_message(FeedType t, const std::string& msg,
                 if (bids.empty() || asks.empty()) return r;
                 r.snap.bid     = bids.rbegin()->first;
                 r.snap.ask     = asks.begin()->first;
+                {
+                    // top-3 bids: highest prices (map is ascending -> walk from end)
+                    double bd = 0.0; int c = 0;
+                    for (auto it2 = bids.rbegin(); it2 != bids.rend() && c < 3; ++it2, ++c)
+                        bd += it2->first * it2->second;
+                    r.snap.bid_depth_usdt = c > 0 ? bd : -1.0;
+                    // top-3 asks: lowest prices (walk from begin)
+                    double ad = 0.0; c = 0;
+                    for (auto it2 = asks.begin(); it2 != asks.end() && c < 3; ++it2, ++c)
+                        ad += it2->first * it2->second;
+                    r.snap.ask_depth_usdt = c > 0 ? ad : -1.0;
+                }
                 r.snap.exch_ts = exch_ts;
                 r.symbol_idx   = last_idx;
                 break;
@@ -569,6 +637,8 @@ static ParseResult parse_message(FeedType t, const std::string& msg,
                 if (d["bids"].empty() || d["asks"].empty()) return r;
                 r.snap.bid     = std::stod(d["bids"][0][0].get<std::string>());
                 r.snap.ask     = std::stod(d["asks"][0][0].get<std::string>());
+                r.snap.bid_depth_usdt = depth_notional(d["bids"], 3);
+                r.snap.ask_depth_usdt = depth_notional(d["asks"], 3);
                 r.snap.exch_ts = std::stoll(d.value("ts", std::string("0")));
                 r.symbol_idx   = it->second;
                 break;
@@ -647,6 +717,8 @@ static ParseResult parse_message(FeedType t, const std::string& msg,
                 if (d["bids"].empty() || d["asks"].empty()) return r;
                 r.snap.bid     = std::stod(d["bids"][0][0].get<std::string>());
                 r.snap.ask     = std::stod(d["asks"][0][0].get<std::string>());
+                r.snap.bid_depth_usdt = depth_notional(d["bids"], 3);
+                r.snap.ask_depth_usdt = depth_notional(d["asks"], 3);
                 r.snap.exch_ts = j.value("timestamp", local_ts);
                 r.symbol_idx   = it->second;
                 break;
@@ -677,10 +749,17 @@ struct FeedConfig {
 struct AppConfig {
     std::string            reference_name;
     std::string            reference_type;
-    std::string            reference_base_url;
+    std::string            reference_base_url;  // Binance combined-stream base
+    std::string            reference_url;       // full URL for other exchanges
     std::vector<SymbolCfg> reference_symbols;
 
     std::vector<FeedConfig> targets;
+
+    // Optional dedicated feed supplying the USDT/USD conversion rate, used to
+    // normalize USDT-quoted targets (e.g. Phemex SOL/USDT) to the USD-quoted
+    // reference. Empty/disabled -> rate stays at the 1.0 default.
+    bool       has_usdt_rate = false;
+    FeedConfig usdt_rate;
 
     double signal_open_bps    = 4.0;
     double signal_close_bps   = 1.5;
@@ -707,6 +786,7 @@ static AppConfig load_config(const std::string& path) {
     c.reference_name     = ref.value("name", std::string());
     c.reference_type     = ref.value("type", std::string());
     c.reference_base_url = ref.value("base_url", std::string());
+    c.reference_url      = ref.value("url", std::string());
     c.reference_symbols  = parse_symbols(ref.at("symbols"));
 
     for (const auto& t : j.at("targets")) {
@@ -716,6 +796,16 @@ static AppConfig load_config(const std::string& path) {
         f.type    = t.value("type", std::string());
         f.symbols = parse_symbols(t.at("symbols"));
         c.targets.push_back(std::move(f));
+    }
+
+    if (j.contains("usdt_rate")) {
+        const json& u       = j.at("usdt_rate");
+        c.usdt_rate.name    = u.value("name", std::string("UsdtRate"));
+        c.usdt_rate.url     = u.value("url", std::string());
+        c.usdt_rate.type    = u.value("type", std::string());
+        c.usdt_rate.symbols = parse_symbols(u.at("symbols"));
+        c.has_usdt_rate =
+            !c.usdt_rate.url.empty() && !c.usdt_rate.symbols.empty();
     }
 
     c.signal_open_bps    = j.value("signal_open_bps", 4.0);
@@ -736,6 +826,18 @@ static std::string build_binance_combined_url(const std::string& base_url,
         streams += symbols[i].local + "@depth5@100ms";
     }
     return base_url + "/stream?streams=" + streams;
+}
+
+// Resolve the connection URL for the reference feed from its config. Binance
+// encodes its symbols into a combined-stream URL built from "base_url"; every
+// other exchange type subscribes after connect, so it uses the plain "url"
+// field exactly like the targets do.
+static std::string build_reference_url(FeedType type, const std::string& base_url,
+                                       const std::string& url,
+                                       const std::vector<SymbolCfg>& symbols) {
+    if (type == FeedType::Binance && !base_url.empty())
+        return build_binance_combined_url(base_url, symbols);
+    return url;
 }
 
 // Parse "wss://host:port/path" into pieces.
@@ -1044,6 +1146,7 @@ public:
         std::filesystem::create_directories("logs");
 
         reference_.resize(cfg_.reference_symbols.size());
+        ref_mid_hist_.resize(cfg_.reference_symbols.size());
 
         // one ExchangeState (+ one CSV per symbol) per target
         for (const auto& t : cfg_.targets) {
@@ -1054,7 +1157,7 @@ public:
                 SymbolState ss;
                 ss.display       = sym.display;
                 ss.rolling_window = cfg_.rolling_window;
-                open_csv(ex.name, sym.display, ss);
+                open_csv(cfg_.reference_name, ex.name, sym.display, ss);
                 ex.symbols.push_back(std::move(ss));
             }
             exchanges_.push_back(std::move(ex));
@@ -1062,16 +1165,27 @@ public:
     }
 
     void run() {
-        // reference feed: Binance combined stream over all configured symbols
+        // reference feed: config-driven data source over all configured symbols
         FeedConfig ref_cfg;
         ref_cfg.name    = cfg_.reference_name;
         ref_cfg.type    = cfg_.reference_type;
-        ref_cfg.url     = build_binance_combined_url(cfg_.reference_base_url, cfg_.reference_symbols);
+        ref_cfg.url     = build_reference_url(feed_type(cfg_.reference_type),
+                                              cfg_.reference_base_url,
+                                              cfg_.reference_url,
+                                              cfg_.reference_symbols);
         ref_cfg.symbols = cfg_.reference_symbols;
 
         auto ref = std::make_shared<FeedConnection>(ioc_, ssl_ctx_, *this, -1, ref_cfg);
         conns_.push_back(ref);
         ref->start();
+
+        // optional USDT/USD rate feed (its own independent WS connection)
+        if (cfg_.has_usdt_rate) {
+            auto rate = std::make_shared<FeedConnection>(
+                ioc_, ssl_ctx_, *this, kRateIndex, cfg_.usdt_rate);
+            conns_.push_back(rate);
+            rate->start();
+        }
 
         // target feeds
         for (std::size_t i = 0; i < cfg_.targets.size(); ++i) {
@@ -1087,8 +1201,19 @@ public:
     // ───── called from FeedConnection ─────
     void on_price(int index, int symbol_idx, const FeedSnapshot& snap) {
         if (symbol_idx < 0) return;
+        if (index == kRateIndex) {
+            if (snap.valid && snap.mid > 0.0) usdt_usd_rate_ = snap.mid;
+            return;
+        }
         if (index < 0) {
-            if (symbol_idx < (int)reference_.size()) reference_[symbol_idx] = snap;
+            if (symbol_idx < (int)reference_.size()) {
+                reference_[symbol_idx] = snap;
+                // keep ~70s of (ts, mid) history for price_change_1m_bps
+                auto& h = ref_mid_hist_[symbol_idx];
+                h.emplace_back(snap.local_ts, snap.mid);
+                int64_t cutoff = snap.local_ts - 70000;
+                while (!h.empty() && h.front().first < cutoff) h.pop_front();
+            }
             return;
         }
         ExchangeState& ex = exchanges_[index];
@@ -1099,6 +1224,10 @@ public:
     }
 
     void on_status(int index, bool up) {
+        if (index == kRateIndex) {
+            usdt_rate_connected_ = up;
+            return;
+        }
         if (index < 0) {
             reference_connected_ = up;
             if (!up) for (auto& r : reference_) r.valid = false;
@@ -1125,16 +1254,26 @@ public:
     const std::vector<FeedSnapshot>& reference() const { return reference_; }
 
 private:
-    void open_csv(const std::string& exch_name, const std::string& display, SymbolState& s) {
-        std::string slug = display;
-        for (auto& c : slug) if (c == '/') c = '_';
-        std::string fn = "logs/" + exch_name + "_" + slug + "_latency.csv";
+    void open_csv(const std::string& signal_name, const std::string& target_name,
+                  const std::string& display, SymbolState& s) {
+        // {SignalExchange}_{TargetExchange}_{BASE}_{QUOTE}_latency.csv
+        std::string base_quote = display;
+        for (auto& c : base_quote) if (c == '/') c = '_';
+        std::string fn = "logs/" + signal_name + "_" + target_name + "_" +
+                         base_quote + "_latency.csv";
         bool exists = std::filesystem::exists(fn) &&
                       std::filesystem::file_size(fn) > 0;
         s.csv.open(fn, std::ios::app);
         if (!exists) {
+            // 7 original columns, then 12 appended. Header written only when the
+            // file is newly created (size 0); always opened in append mode.
             s.csv << "timestamp_ms,direction,peak_delta_bps,duration_ms,"
-                     "binance_mid,target_mid,exch_lag_ms\n";
+                     "reference_mid,target_mid,exch_lag_ms,"
+                     "signal_source,target_exchange,pair,"
+                     "entry_bps,gap_open_ts_ms,gap_close_ts_ms,"
+                     "signal_to_detect_ms,orderbook_depth_usdt,"
+                     "binance_volume_1m_usdt,price_change_1m_bps,"
+                     "hour_of_day_utc,day_of_week\n";
             s.csv.flush();
         }
     }
@@ -1144,13 +1283,56 @@ private:
                symbol_idx < (int)reference_.size() && reference_[symbol_idx].valid;
     }
 
+    // A USDT-quoted target compared against a USD-quoted reference must be
+    // normalized by the live USDT/USD rate before computing the delta.
+    bool needs_usdt_conv(int symbol_idx, const std::string& tgt_display) const {
+        if (!cfg_.has_usdt_rate) return false;
+        if (symbol_idx < 0 || symbol_idx >= (int)cfg_.reference_symbols.size())
+            return false;
+        return is_usdt_pair(tgt_display) &&
+               is_usd_pair(cfg_.reference_symbols[symbol_idx].display);
+    }
+
+    // Signal-feed mid move over the last ~60s in bps (positive = up).
+    // Returns -1.0 if there is no sample at least 60s old to compare against.
+    double price_change_1m_bps(int symbol_idx, double cur_mid) const {
+        if (symbol_idx < 0 || symbol_idx >= (int)ref_mid_hist_.size()) return -1.0;
+        const auto& h = ref_mid_hist_[symbol_idx];
+        int64_t target = now_ms() - 60000;
+        double old_mid = -1.0;
+        for (const auto& pr : h) {        // history is in ascending time order
+            if (pr.first <= target) old_mid = pr.second;
+            else break;
+        }
+        if (old_mid <= 0.0) return -1.0;
+        return ((cur_mid - old_mid) / old_mid) * 10000.0;
+    }
+
     void compute_metrics(ExchangeState& ex, SymbolState& ss, int symbol_idx) {
         if (!reference_usable(symbol_idx) || !ss.latest.valid) {
             ss.cur_valid = false;
             return;
         }
         const FeedSnapshot& ref = reference_[symbol_idx];
-        const FeedSnapshot& tgt = ss.latest;
+
+        // Normalize a USDT-quoted target to USD (mutable copy; ss.latest keeps
+        // the raw exchange price). When the rate feed hasn't connected yet we
+        // fall back to the 1.0 default and warn once.
+        FeedSnapshot tgt = ss.latest;
+        if (needs_usdt_conv(symbol_idx, ss.display)) {
+            const double rate = usdt_usd_rate_;
+            if (!usdt_rate_connected_ && !warned_fallback_) {
+                warned_fallback_ = true;
+                static std::ofstream errlog("logs/errors.log", std::ios::app);
+                errlog << now_ms()
+                       << " WARNING using fallback USDT/USD=1.0 "
+                          "(rate feed not yet connected)\n";
+                errlog.flush();
+            }
+            tgt.bid *= rate;
+            tgt.ask *= rate;
+            tgt.mid *= rate;
+        }
 
         double  delta_bps = ((tgt.mid - ref.mid) / ref.mid) * 10000.0;
         int64_t exch_lag  = tgt.exch_ts - ref.exch_ts;
@@ -1167,12 +1349,12 @@ private:
         while ((int)ss.delta_samples.size() > ss.rolling_window)
             ss.delta_samples.pop_front();
 
-        update_signal(ex, ss, delta_bps, tgt, ref);
+        update_signal(ex, ss, symbol_idx, delta_bps, tgt, ref);
     }
 
-    void update_signal(ExchangeState& ex, SymbolState& ss, double delta_bps,
-                       const FeedSnapshot& tgt, const FeedSnapshot& ref) {
-        (void)ex;
+    void update_signal(ExchangeState& ex, SymbolState& ss, int symbol_idx,
+                       double delta_bps, const FeedSnapshot& tgt,
+                       const FeedSnapshot& ref) {
         const double absd = std::abs(delta_bps);
         const int64_t t   = now_ms();
 
@@ -1185,6 +1367,15 @@ private:
                     ss.signal_open_time = ss.gap_start_time;
                     ss.signal_peak_bps  = absd;
                     ss.signal_dir = (delta_bps < 0) ? "CHEAPER" : "RICHER";
+
+                    // detection-time context, frozen here and emitted on close
+                    ss.entry_bps            = absd;
+                    ss.signal_to_detect_ms  = (ref.local_ts > 0)
+                                                  ? (t - ref.local_ts) : -1;
+                    ss.entry_bid_depth_usdt = tgt.bid_depth_usdt;
+                    ss.entry_ask_depth_usdt = tgt.ask_depth_usdt;
+                    ss.entry_price_chg_1m_bps =
+                        price_change_1m_bps(symbol_idx, ref.mid);
                 }
             } else {
                 ss.gap_start_time = 0;  // require continuous excursion
@@ -1195,7 +1386,7 @@ private:
             else                ss.signal_dir = "RICHER";
             if (absd < cfg_.signal_close_bps) {
                 int64_t duration = t - ss.signal_open_time;
-                log_signal(ss, duration, tgt, ref);
+                log_signal(ss, duration, tgt, ref, ex);
                 ss.signals_total++;
                 ss.avg_duration_ms +=
                     (duration - ss.avg_duration_ms) / ss.signals_total;
@@ -1207,11 +1398,43 @@ private:
     }
 
     void log_signal(SymbolState& ss, int64_t duration,
-                    const FeedSnapshot& tgt, const FeedSnapshot& ref) {
+                    const FeedSnapshot& tgt, const FeedSnapshot& ref,
+                    const ExchangeState& ex) {
         if (!ss.csv) return;
-        ss.csv << now_ms() << ',' << ss.signal_dir << ','
+        const int64_t now       = now_ms();
+        const int64_t gap_close = now;  // signal just fell back below threshold
+
+        // target liquidity on the side we'd hit: CHEAPER -> we buy at best ask,
+        // RICHER -> we sell at best bid. Already -1 when depth was unavailable.
+        double depth = -1.0;
+        if (ss.signal_dir == "CHEAPER")      depth = ss.entry_ask_depth_usdt;
+        else if (ss.signal_dir == "RICHER")  depth = ss.entry_bid_depth_usdt;
+
+        int hour = -1, dow = -1;
+        utc_hour_dow(ss.signal_open_time, hour, dow);
+
+        std::string signal_source   = cfg_.reference_type.empty()
+                                           ? "unknown" : cfg_.reference_type;
+        std::string target_exchange = ex.type.empty() ? "unknown" : ex.type;
+        std::string pair            = ss.display.empty() ? "unknown" : ss.display;
+
+        ss.csv << now << ',' << ss.signal_dir << ','
                << ss.signal_peak_bps << ',' << duration << ',' << ref.mid
-               << ',' << tgt.mid << ',' << (tgt.exch_ts - ref.exch_ts) << '\n';
+               << ',' << tgt.mid << ',' << (tgt.exch_ts - ref.exch_ts)
+               // ── 12 appended columns ──
+               << ',' << signal_source
+               << ',' << target_exchange
+               << ',' << pair
+               << ',' << ss.entry_bps
+               << ',' << ss.signal_open_time          // gap_open_ts_ms
+               << ',' << gap_close                    // gap_close_ts_ms
+               << ',' << ss.signal_to_detect_ms
+               << ',' << depth                        // orderbook_depth_usdt
+               << ',' << -1                           // binance_volume_1m_usdt (no kline REST)
+               << ',' << ss.entry_price_chg_1m_bps
+               << ',' << hour
+               << ',' << dow
+               << '\n';
         ss.csv.flush();
     }
 
@@ -1267,6 +1490,10 @@ private:
         return display.size() >= 4 && display.substr(display.size() - 4) == "/USD";
     }
 
+    static bool is_usdt_pair(const std::string& display) {
+        return display.size() >= 5 && display.substr(display.size() - 5) == "/USDT";
+    }
+
     void render() {
         if (std::system("clear")) {}
         const std::vector<int> W = {14, 12, 11, 9, 9};
@@ -1276,9 +1503,16 @@ private:
         std::strftime(tbuf, sizeof(tbuf), "%H:%M:%S", std::localtime(&tt));
 
         std::cout << col::bold << col::cyan << "  LATENCY MONITOR  " << tbuf
-                  << col::reset << "\n\n";
+                  << col::reset << "\n";
 
-        bool any_usd_pair = false;
+        if (cfg_.has_usdt_rate) {
+            std::cout << "  USDT/USD: " << std::fixed << std::setprecision(4)
+                      << usdt_usd_rate_
+                      << (usdt_rate_connected_ ? "" : "  (fallback 1.0)") << "\n";
+        }
+        std::cout << "\n";
+
+        bool any_usdt_conv = false;
 
         for (std::size_t sidx = 0; sidx < cfg_.reference_symbols.size(); ++sidx) {
             const std::string& display = cfg_.reference_symbols[sidx].display;
@@ -1305,9 +1539,9 @@ private:
                 SymbolState& ss = ex.symbols[sidx];
 
                 std::string label = ex.name;
-                if (is_usd_pair(ss.display)) {
+                if (needs_usdt_conv((int)sidx, ss.display)) {
                     label += "*";
-                    any_usd_pair = true;
+                    any_usdt_conv = true;
                 }
 
                 if (!ex.connected) {
@@ -1349,9 +1583,9 @@ private:
             std::cout << hline(W, "╚", "╩", "╝") << "\n\n";
         }
 
-        if (any_usd_pair)
-            std::cout << "  * USD pair (not USDT) — delta vs the USDT reference "
-                         "may include a stablecoin basis spread\n\n";
+        if (any_usdt_conv)
+            std::cout << "  * USDT pair normalized to USD via the live "
+                         "USDT/USD rate\n\n";
 
         // active signals
         std::cout << "  Active signals:\n";
@@ -1403,8 +1637,18 @@ private:
     AppConfig         cfg_;
     net::steady_timer display_timer_;
 
+    // sentinel feed index for the dedicated USDT/USD rate connection
+    static constexpr int kRateIndex = -2;
+
     std::vector<FeedSnapshot> reference_;
+    // rolling (local_ts, mid) history of the signal feed, per reference symbol
+    std::vector<std::deque<std::pair<int64_t, double>>> ref_mid_hist_;
     bool                      reference_connected_ = false;
+
+    // live USDT/USD conversion rate (1.0 until the rate feed delivers a price)
+    double usdt_usd_rate_      = 1.0;
+    bool   usdt_rate_connected_ = false;
+    bool   warned_fallback_    = false;
 
     std::vector<ExchangeState>                   exchanges_;
     std::vector<std::shared_ptr<FeedConnection>> conns_;
